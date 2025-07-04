@@ -3,7 +3,7 @@ import vlc
 import math
 import time
 import socket
-from concurrent.futures import ThreadPoolExecutor
+import urllib.parse
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QTextEdit, QDialog, QVBoxLayout, 
                              QGridLayout, QWidget, QLabel, QMessageBox, QComboBox, QHBoxLayout, QProgressBar)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
@@ -44,10 +44,9 @@ class InputDialog(QDialog):
         self.setLayout(self.layout)
 
 class StreamUpdateWorker(QThread):
-    """Worker thread for heavy stream operations"""
     progress_update = pyqtSignal(str)
     layout_ready = pyqtSignal()
-    stream_configured = pyqtSignal(int, object, bool, str)  # index, player, status, message
+    stream_configured = pyqtSignal(int, object, bool, str)
     finished = pyqtSignal()
     
     def __init__(self, urls, grid_size, vlc_instance, max_streams, parent=None):
@@ -60,40 +59,47 @@ class StreamUpdateWorker(QThread):
         self.stream_status = []
         
     def check_rtsp_url(self, url):
-        """Check if RTSP URL is reachable"""
         try:
-            host = url.split('@')[1].split(':')[0] if '@' in url else url.split('//')[1].split(':')[0]
-            port = int(url.split(':')[2].split('/')[0]) if len(url.split(':')) > 2 else 554
-            with socket.create_connection((host, port), timeout=2):
+            parsed_url = urllib.parse.urlparse(url)
+            host = parsed_url.hostname
+            port = parsed_url.port or 554
+            with socket.create_connection((host, port), timeout=3):
+                print(f"URL {url} is reachable")
                 return True
-        except Exception:
+        except Exception as e:
+            print(f"URL {url} is unreachable: {str(e)}")
+            return False
+    
+    def validate_media(self, url):
+        try:
+            media = self.vlc_instance.media_new(url)
+            media.add_option('rtsp-tcp')
+            media.parse_with_options(vlc.MediaParseFlag.network, 10000)  # 10s timeout
+            state = media.get_state()
+            parsed = media.is_parsed()
+            media.release()
+            if state == vlc.State.Error or not parsed:
+                print(f"Invalid media for {url}: state={state}")
+                return False
+            print(f"Valid media for {url}")
+            return True
+        except Exception as e:
+            print(f"Error validating media for {url}: {str(e)}")
             return False
     
     def run(self):
-        """Perform heavy stream setup operations in background thread"""
         try:
             self.progress_update.emit("Preparing streams...")
             
-            # Prepare required number of streams
             required_labels = min(self.grid_size * self.grid_size, self.max_streams)
             
-            # Check URLs in parallel using ThreadPoolExecutor
-            url_status = {}
-            if self.urls:
-                self.progress_update.emit("Checking URL connectivity...")
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    future_to_url = {executor.submit(self.check_rtsp_url, url): url for url in self.urls}
-                    for future in future_to_url:
-                        url = future_to_url[future]
-                        try:
-                            url_status[url] = future.result()
-                        except Exception:
-                            url_status[url] = False
+            # Check URLs sequentially
+            self.progress_update.emit("Checking URL connectivity...")
+            url_status = {url: self.check_rtsp_url(url) and self.validate_media(url) for url in self.urls}
             
-            # Signal that layout can be updated
             self.layout_ready.emit()
             
-            # Create and configure players
+            # Configure players sequentially
             for i in range(required_labels):
                 self.progress_update.emit(f"Configuring stream {i+1}/{required_labels}...")
                 
@@ -102,29 +108,22 @@ class StreamUpdateWorker(QThread):
                 message = ""
                 status = False
                 
-                if url:
+                if url and url_status.get(url, False):
                     media = self.vlc_instance.media_new(url)
                     media.add_option('avcodec-hw=auto')
                     media.add_option('no-audio')
                     media.add_option('rtsp-tcp')
+                    media.add_option('no-video-title')
                     player.set_media(media)
-                    
-                    if url_status.get(url, False):
-                        status = True
-                        message = f"Stream {i+1} ready"
-                    else:
-                        message = "Unreachable URL"
+                    status = True
+                    message = f"Stream {i+1} ready"
                 else:
-                    message = "No Stream"
+                    message = "No Stream" if not url else "Unreachable or Invalid URL"
                 
                 self.players.append(player)
                 self.stream_status.append(status)
-                
-                # Emit signal for each configured stream
                 self.stream_configured.emit(i, player, status, message)
-                
-                # Small delay to prevent overwhelming the GUI
-                self.msleep(100)
+                self.msleep(200)
             
             self.progress_update.emit("Stream setup complete!")
             
@@ -145,9 +144,9 @@ class RTSPViewer(QMainWindow):
         self.stream_status = []
         self.max_streams = 8
         self.grid_size = 2
-        self.vlc_instance = vlc.Instance('--no-xlib --verbose=2 --network-caching=150 --no-video-title-show '
-                                         '--clock-jitter=0 --clock-synchro=0 --rtsp-frame-buffer-size=15000 '
-                                         '--rtsp-timeout=5')
+        self.vlc_instance = vlc.Instance('--no-xlib --verbose=2 --network-caching=300 --no-video-title-show '
+                                         '--clock-jitter=0 --clock-synchro=0 --rtsp-frame-buffer-size=10000 '
+                                         '--rtsp-timeout=10 --aout=dummy --no-audio')
         self.worker = None
         self.updating = False
         
@@ -164,7 +163,6 @@ class RTSPViewer(QMainWindow):
         self.grid_combo.addItems(["1 (1x1)", "4 (2x2)", "9 (3x3)"])
         self.grid_combo.currentTextChanged.connect(self.change_grid_size)
         
-        # Progress bar for operations
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.status_label = QLabel("Ready")
@@ -196,7 +194,6 @@ class RTSPViewer(QMainWindow):
             self.start_stream_update(urls_text)
             
     def change_grid_size(self, text):
-        """Handle grid size change without blocking GUI"""
         if self.updating:
             return
             
@@ -205,20 +202,19 @@ class RTSPViewer(QMainWindow):
             if new_grid_size != self.grid_size:
                 self.grid_size = new_grid_size
                 print(f"Changed grid size to {self.grid_size}x{self.grid_size}")
-                # Use QTimer to defer heavy operation to next event loop iteration
                 QTimer.singleShot(0, lambda: self.start_stream_update('\n'.join(self.rtsp_urls)))
         except Exception as e:
-            print(f"Error changing grid size: {e}")
+            print(f"Error changing grid size: {str(e)}")
     
     def start_stream_update(self, urls_text):
-        """Start stream update in background thread"""
         if self.updating:
             return
             
         self.updating = True
         self.set_controls_enabled(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # Indeterminate progress
+        self.progress_bar.setRange(0, 0)
+        self.central_widget.setUpdatesEnabled(False)
         
         # Parse URLs
         new_urls = [url.strip() for url in urls_text.strip().split('\n') if url.strip()]
@@ -226,7 +222,7 @@ class RTSPViewer(QMainWindow):
             QMessageBox.warning(self, "Warning", f"Maximum {self.max_streams} streams allowed. Taking first {self.max_streams} URLs.")
             new_urls = new_urls[:self.max_streams]
         
-        # Stop existing players gracefully
+        # Stop existing players
         self.stop_existing_players()
         
         # Start worker thread
@@ -240,32 +236,25 @@ class RTSPViewer(QMainWindow):
         self.rtsp_urls = new_urls
     
     def stop_existing_players(self):
-        """Stop existing players without blocking GUI"""
         for player in self.players:
             if player:
                 try:
-                    player.stop()
-                    # Don't call release() immediately, let it stop gracefully
-                    QTimer.singleShot(500, lambda p=player: self.release_player(p))
+                    state = player.get_state()
+                    if state not in (vlc.State.Stopped, vlc.State.Ended):
+                        player.stop()
+                        print("Player stopped")
+                    time.sleep(2.0)
+                    player.release()
+                    print("Player released")
                 except Exception as e:
-                    print(f"Error stopping player: {e}")
+                    print(f"Error stopping/releasing player: {str(e)}")
         self.players = []
         self.stream_status = []
     
-    def release_player(self, player):
-        """Release player after delay"""
-        try:
-            player.release()
-        except Exception as e:
-            print(f"Error releasing player: {e}")
-    
     def prepare_layout(self):
-        """Prepare layout for new streams (called from worker thread)"""
-        # This runs in main thread due to Qt's signal-slot mechanism
         required_labels = min(self.grid_size * self.grid_size, self.max_streams)
         current_label_count = len(self.labels)
         
-        # Adjust number of labels
         if current_label_count < required_labels:
             for _ in range(required_labels - current_label_count):
                 label = CustomLabel(self.central_widget)
@@ -282,26 +271,24 @@ class RTSPViewer(QMainWindow):
         self.update_grid_layout()
     
     def configure_stream(self, index, player, status, message):
-        """Configure individual stream (called from worker thread)"""
-        # This runs in main thread due to Qt's signal-slot mechanism
         if index < len(self.labels):
             self.labels[index].setText(message)
             
             if status and player:
-                try:
-                    player.set_hwnd(self.labels[index].winId())
-                    result = player.play()
-                    if result == -1:
-                        self.labels[index].setText(f"Stream {index+1} Error")
-                        status = False
-                    else:
-                        print(f"Started player {index}")
-                except Exception as e:
-                    print(f"Error starting player {index}: {e}")
-                    self.labels[index].setText(f"Stream Error: {str(e)}")
-                    status = False
+                for attempt in range(3):
+                    try:
+                        player.set_hwnd(self.labels[index].winId())
+                        if player.play() == -1:
+                            raise Exception("Failed to start player")
+                        print(f"Started player {index} (attempt {attempt + 1})")
+                        break
+                    except Exception as e:
+                        print(f"Error starting player {index} (attempt {attempt + 1}): {str(e)}")
+                        if attempt == 2:
+                            self.labels[index].setText(f"Stream Error: {str(e)}")
+                            status = False
+                        time.sleep(3.0)
             
-            # Update internal state
             if index >= len(self.players):
                 self.players.extend([None] * (index + 1 - len(self.players)))
                 self.stream_status.extend([False] * (index + 1 - len(self.stream_status)))
@@ -310,38 +297,33 @@ class RTSPViewer(QMainWindow):
             self.stream_status[index] = status
     
     def stream_update_finished(self):
-        """Called when stream update is complete"""
         self.updating = False
         self.set_controls_enabled(True)
         self.progress_bar.setVisible(False)
         self.status_label.setText("Ready")
+        self.central_widget.setUpdatesEnabled(True)
         
         if self.worker:
             self.worker.deleteLater()
             self.worker = None
     
     def set_controls_enabled(self, enabled):
-        """Enable/disable controls during operations"""
         self.input_button.setEnabled(enabled)
         self.grid_combo.setEnabled(enabled)
     
     def update_status(self, message):
-        """Update status label"""
         self.status_label.setText(message)
         
     def update_grid_layout(self):
-        """Update grid layout with current labels"""
         print("Updating grid layout")
         if not self.labels:
             return
             
-        # Clear existing grid
         for i in reversed(range(self.grid_layout.count())):
             item = self.grid_layout.itemAt(i)
             if item and item.widget():
                 item.widget().setParent(None)
             
-        # Place labels in grid
         for i, label in enumerate(self.labels):
             row = i // self.grid_size
             col = i % self.grid_size
@@ -350,7 +332,6 @@ class RTSPViewer(QMainWindow):
         print("Grid layout updated")
         
     def monitor_streams(self):
-        """Monitor stream status and restart failed streams"""
         if self.updating:
             QTimer.singleShot(5000, self.monitor_streams)
             return
@@ -359,22 +340,19 @@ class RTSPViewer(QMainWindow):
             if player and i < len(self.stream_status) and self.stream_status[i]:
                 try:
                     state = player.get_state()
-                    if state == vlc.State.Error or state == vlc.State.Ended:
+                    if state in (vlc.State.Error, vlc.State.Ended):
                         print(f"Stream {i} failed: {state}")
                         self.stream_status[i] = False
                         if i < len(self.labels):
                             self.labels[i].setText("Stream Error - Restarting...")
                         
-                        # Attempt restart without blocking GUI
                         QTimer.singleShot(1000, lambda idx=i: self.restart_stream(idx))
-                        
                 except Exception as e:
-                    print(f"Error checking stream {i}: {e}")
+                    print(f"Error checking stream {i}: {str(e)}")
                     
         QTimer.singleShot(5000, self.monitor_streams)
     
     def restart_stream(self, index):
-        """Restart a failed stream"""
         if (index < len(self.players) and index < len(self.rtsp_urls) and 
             index < len(self.labels) and self.players[index]):
             try:
@@ -386,27 +364,28 @@ class RTSPViewer(QMainWindow):
                 else:
                     self.labels[index].setText(f"Stream {index+1} Failed")
             except Exception as e:
-                print(f"Error restarting stream {index}: {e}")
+                print(f"Error restarting stream {index}: {str(e)}")
                 self.labels[index].setText(f"Restart Error: {str(e)}")
         
     def closeEvent(self, event):
-        """Clean shutdown"""
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
-            self.worker.wait(3000)  # Wait up to 3 seconds
+            self.worker.wait(3000)
             
         for player in self.players:
             if player:
                 try:
-                    player.stop()
+                    state = player.get_state()
+                    if state not in (vlc.State.Stopped, vlc.State.Ended):
+                        player.stop()
                     player.release()
                 except Exception as e:
-                    print(f"Error releasing player: {e}")
+                    print(f"Error releasing player: {str(e)}")
         
         try:
             self.vlc_instance.release()
         except Exception as e:
-            print(f"Error releasing VLC instance: {e}")
+            print(f"Error releasing VLC instance: {str(e)}")
             
         event.accept()
 
